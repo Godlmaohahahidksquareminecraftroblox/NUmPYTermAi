@@ -1,0 +1,136 @@
+import numpy as np
+import os, math, pickle
+
+# --- Constants ---
+SAVE_PATH = "model_attn.npz"
+context_length = 16
+max_tokens = 100
+temperature = 1
+top_k = 20
+debug_logits = False  # 🔍 Set to True to inspect logits each token
+# --- Hyperparameters ---
+SAVE_PATH = "model_attn.npz"
+ADAM_PATH = "adam_attn.pkl"
+
+embed_dim = 192          # larger embedding
+context_length = 64
+mlp_hidden = 512         # scale up MLP with embedding  num_layers = 4           # 4 transformer blocks
+
+learning_rate = 1e-4     # a bit smaller to prevent overfitting
+weight_decay = 5e-4      # slightly higher regularization
+beta1, beta2 = 0.9, 0.98 # slightly more stable Adam betas
+eps = 1e-8                                              
+batch_size = 32          # larger batch can help smooth training
+max_steps = 100000       # train longer since model is bigger
+save_every = 1000
+early_stop_patience = 20
+
+grad_clip = 0.5          # clip gradients tighter for stability                                                 dropout_prob = 0.5       # strong dropout to improve generalization
+np.random.seed(42)
+
+# --- Load Vocab ---
+with open("dataset.txt", "r", encoding="utf-8") as f:
+    data_text = f.read()
+chars = sorted(set(data_text))
+vocab_size = len(chars)
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+enc = lambda s: [stoi.get(c, 0) for c in s]
+dec = lambda arr: ''.join(itos[i] for i in arr)
+
+# --- MiniTransformer (no backprop)
+class TransformerBlock:
+    def __init__(self, D):
+        self.wqkv = self.wo = self.w1 = self.b1 = self.w2 = self.b2 = None
+
+    def forward(self, x, train=False):
+        B, T, D = x.shape
+        qkv = x @ self.wqkv
+        q, k, v = np.split(qkv, 3, axis=-1)
+        att_raw = (q @ k.transpose(0, 2, 1)) / math.sqrt(D)
+        mask = np.tril(np.ones((T, T), dtype=att_raw.dtype))
+        att_raw = att_raw * mask + -1e9 * (1 - mask)
+        att = np.exp(att_raw - att_raw.max(-1, keepdims=True))
+        att /= att.sum(-1, keepdims=True)
+        a = att @ v @ self.wo
+        x1 = (x + a - (x + a).mean(-1, keepdims=True)) / ((x + a).std(-1, keepdims=True) + 1e-5)
+        h = np.maximum(0, x1 @ self.w1 + self.b1)
+        x2 = (x1 + h @ self.w2 + self.b2 - (x1 + h @ self.w2 + self.b2).mean(-1, keepdims=True)) / ((x1 + h @ self.w2 + self.b2).std(-1, keepdims=True) + 1e-5)
+        return x2
+
+class MiniTransformer:
+    def __init__(self):
+        self.token_embed = self.pos_embed = self.head = self.bh = None
+        self.blocks = []
+
+    def set_weights(self, d):
+        self.token_embed = d["token_embed"]
+        self.pos_embed = d["pos_embed"]
+        self.head = d["head"]
+        self.bh = d["bh"]
+        num_layers = sum(1 for k in d if k.startswith("blk")) // 6
+        self.blocks = [TransformerBlock(self.token_embed.shape[1]) for _ in range(num_layers)]
+        for i, blk in enumerate(self.blocks):
+            blk.wqkv = d[f"blk{i}_wqkv"]
+            blk.wo = d[f"blk{i}_wo"]
+            blk.w1 = d[f"blk{i}_w1"]
+            blk.b1 = d[f"blk{i}_b1"]
+            blk.w2 = d[f"blk{i}_w2"]
+            blk.b2 = d[f"blk{i}_b2"]
+
+    def forward(self, idx):
+        B, T = idx.shape
+        x = self.token_embed[idx] + self.pos_embed[:, :T, :]
+        for blk in self.blocks:
+            x = blk.forward(x)
+        return x @ self.head + self.bh
+
+# --- Load Weights ---
+z = np.load(SAVE_PATH, allow_pickle=True)
+step = int(z["step"])
+weights = {k: z[k] for k in z.files if k != "step"}
+
+model = MiniTransformer()
+model.set_weights(weights)
+
+# --- Sampling ---
+def sample(logits):
+    logits = logits.astype(np.float32)[0, -1] / temperature
+    if top_k is not None:
+        idx = np.argpartition(-logits, top_k)[:top_k]
+        logits_ = logits[idx]
+        probs = np.exp(logits_ - np.max(logits_))
+        probs /= probs.sum()
+        if debug_logits:
+            print("🔍 Top-k:", [(itos[i], round(p, 3)) for i, p in zip(idx, probs)])
+        return np.random.choice(idx, p=probs)
+    else:
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        return np.random.choice(len(logits), p=probs)
+
+# --- Generate ---
+def generate(prompt, max_new_tokens=100):
+    idx = enc(prompt)
+    end_token = enc("\n")
+    min_tokens = 3  # Don't allow early exit before 3 tokens
+
+    for i in range(max_new_tokens):
+        idx_cond = np.array([idx[-context_length:]], dtype=np.int32)
+        logits = model.forward(idx_cond)
+        next_token = sample(logits)
+        idx.append(int(next_token))
+
+        if i >= min_tokens and idx[-len(end_token):] == end_token:
+            break
+
+    return dec(idx).replace("\n", "")
+
+# --- CLI Prompt ---
+while True:
+    try:
+        prompt = input(">>> ")
+        print(generate(prompt, max_tokens))
+    except KeyboardInterrupt:
+        print("\n👋 Bye!")
+        break
