@@ -30,7 +30,7 @@ A lightweight LLM training script for Termux built with **NumPy**, **math**, **o
 You can install NumPy via:
 ```bash
 pip install numpy
-
+```
 
 ---
 
